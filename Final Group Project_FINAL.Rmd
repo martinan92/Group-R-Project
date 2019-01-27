@@ -1,0 +1,525 @@
+---
+title: "Final R Project"
+author: "Group D: Andrew Martinez, Paul Jacques-Mignault, Marcos Berges, Vaibhav Jaitly, Nayla Fakhoury, Wieland Klingspor, Claudia Franco"
+date: "12/13/2018"
+output: html_document
+---
+### Introduction
+This analysis seeks to understand and forecast pollutant levels throughout Madrid using measurements taken during 2011 to 2016 by different stations throughout the city. The raw pollutant data has been consolidated along with data regarding measured weather variables and the geographical data of the relevant stations. In particular, Nitrogen Dioxide (NO2), Sulfur Dioxide (SO2), Trioxygen aka Ozone (O3) and fine particles of 2.5 micrometers or less (PM2.5) will be pollutants of interest. 
+
+### Check for and Install Necessary Packages
+```{r packages}
+if(!"data.table" %in% installed.packages()) {install.packages("data.table")}
+library(data.table) 
+
+if(!"readxl" %in% installed.packages()) {install.packages("readxl")}
+library(readxl)
+
+if(!"ggplot2" %in% installed.packages()) {install.packages("ggplot2")}
+library(ggplot2)
+
+if(!"chron" %in% installed.packages()) {install.packages("chron")}
+library(chron)
+
+if(!"leaflet" %in% installed.packages()) {install.packages("leaflet")}
+library(leaflet)
+
+if(!"d3heatmap" %in% installed.packages()) {install.packages("d3heatmap")}
+library(d3heatmap)
+
+if(!"usdm" %in% installed.packages()) {install.packages("usdm")}
+library(usdm)
+
+```
+
+### Custom Functions
+```{r custom_functions}
+
+#Extract the month from CSV name
+getMonth<-function(text, textLength){
+  #As name lengths differ between 20 and 21 char, set extraction rules accordingly
+  if(textLength == 20){
+    month<-as.numeric(substr(text, 16, 16))
+  }else if(textLength == 21){
+    month<-as.numeric(substr(text, 16, 17))
+  }
+  return(month)
+}
+
+#Extract the year from CSV name
+getYear<-function(text){
+  year<-as.numeric(substr(text, 13, 14)) + 2000
+  
+  return(year)
+}
+
+#Gets the proportion of a numerical variable bucket out of the total sum of that variable for all buckets
+getProportion<-function(variable, df){
+  proportion<-(variable/nrow(df) * 100)
+  return(proportion)
+}
+
+#Filters dataset based on compounds to be analyzed (default filtering is set as parameters for this analysis)
+compoundFilter<-function(df, pollutant_array = c('NO2','SO2','O3','PM2.5')){
+  output<-data.frame(df[df$compound %in% pollutant_array,])
+  return(output)
+}
+
+#Combines the given df with the stations df
+bindWithStations<-function(df){
+  output<-merge(df, stations, all.x = T, by.x = 'station', by.y = 'ref')
+  
+  #There are "station" variables in both df, remove the irrelevant one and rename the other
+  output[,"station"] = NULL
+  setnames(output, 'station.y', 'station')
+  
+  return(output)
+}
+
+#Check for multicollinearity in a dataset
+multiCollinearityCheck<-function(df){
+  #Only run test for numerical values
+  multi_check<-data.frame(df[,sapply(df,is.numeric),with=FALSE])
+  output<-vif(multi_check)
+  
+  return(output)
+}
+
+#Remove multicollinear (based on VIF Cutoff) and insignificant variabled
+removeExtraneousVariables<-function(VIF_output, lm_output, VIF_cutoff){
+  #Select variables with VIF above 5 to be removed, but exclude temperature avg and range
+  multicolin_var<-as.character(VIF_output[VIF_output$VIF>=VIF_cutoff,]$Variables)
+  multicolin_var<-multicolin_var[!grepl("avg|range", multicolin_var)]
+  
+  #Select variables with a pval > 0.05 to be removed
+  var_pval<-summary(lm_output)$coef[,"Pr(>|t|)"]
+  insignif_var<-rownames(data.frame(var_pval[var_pval > 0.05]))
+
+  #Only return unqiue variables (add parameter and compound name)
+  output<-unique(c(multicolin_var, as.vector(insignif_var),'parameter','compound'))
+  
+  return(output)
+}
+
+#Creates interactive map of each individual compound
+compoundGeographicalAnalysis<-function(dataset, pollutant){
+  geolocation_data_compound<-dataset[(dataset$year %in% c(2011, 2016) & dataset$compound == pollutant),]
+  
+  #Outputs map of stations with their average pollutant levels over the entire studied time frame
+  colors_yearly <- colors()[c(490,100)]
+  
+  #Print map
+  madrid <- leaflet(data.frame(geolocation_data_compound)) %>%
+    addTiles() %>%  # Add default OpenStreetMap map tiles
+    addCircleMarkers(lng=~lon, lat=~lat,
+                     popup= ~paste(station,compound, sep=' '),
+                     radius = ~total_average_value,
+                     color= ~colors_yearly,
+                     group= unique(geolocation_data_compound$year)) %>% 
+    addLegend("bottomright", colors = colors_yearly, title = paste0("Map of ",pollutant), labels = 
+    unique(geolocation_data_compound$year))
+  
+  return(madrid)
+}
+
+#Prepares output data and plots forecasted values against true values
+runRegressionPlots<-function(data_set, regression_output){
+  #Adds output from regression model to the dataframe
+  data_set<-data.table(data_set[, lm_fit:=fitted(regression_output)])
+  
+  #Reshapes data set (stacks daily average value and lm_fit in one column) to allow for easy graphing
+  df_fit<-melt(data_set[, .(date,daily_average_value,lm_fit)], id.vars = 'date')
+  
+  #Plot during 2011 and 2012
+  plot1<-ggplot(df_fit[df_fit$date < '2013-01-01',], aes(x=date, y=value, group=variable,colour=variable)) +
+          geom_line(lwd=1, alpha=0.7) + scale_color_manual(values=c('black','red')) +
+          theme(axis.text.x=element_text(angle=90))
+  print(plot1)
+  
+  #Plot during 2013 and 2014
+  plot2<-ggplot(df_fit[df_fit$date >= '2013-01-01' & df_fit$date <= '2014-12-31',], aes(x=date, y=value,
+          group=variable,colour=variable)) + geom_line(lwd=1, alpha=0.7) +
+          scale_color_manual(values=c('black','red')) + theme(axis.text.x=element_text(angle=90))
+  print(plot2)
+  
+  #Plot during 2015 and 2016
+  plot3<-ggplot(df_fit[df_fit$date >= '2015-01-01' & df_fit$date <= '2016-12-31',], aes(x=date, y=value,
+          group=variable,colour=variable)) + geom_line(lwd=1, alpha=0.7) +
+          scale_color_manual(values=c('black','red')) + theme(axis.text.x=element_text(angle=90))
+  print(plot3)
+  
+  #Run Residual Analysis Function
+  residualAnalysis(data_set, regression_output)
+  
+}
+
+#Plots charts related to regression residuals
+residualAnalysis<-function(data_set, regression_output){
+  
+  #Histogram of Residuals
+  hist(regression_output$residuals, main="Residual Histogram")
+  
+  #Boxplot of Residuals
+  boxplot(regression_output$residuals, main="Residual Boxplot")
+  
+  #Line plot of Residuals
+  plot(regression_output$residuals, type='l', main='Model Residuals')
+}
+
+
+```
+
+### Initial Setup and Data Preparation
+The following **Knit** section loads, combines, and prepares the given CSV files for this analysis. This section takes 72 separate CSV files and combines them into a single dataframe that gives a daily view of pollutant levels. Furthermore, additional weather and station information was added to the data set to allow for further analysis. The station geographical data is sourced from https://bit.ly/2Kp8TlV and was separately converted to a readable format. As each station will have its own daily average of pollutant levels, a separate dataframe "stations_data_set" was created for geographical analysis.
+
+```{r setup}
+
+######## Load and Consolidate the Data ######## 
+#Import all csv files into a list and ensure only hourly data is loaded
+RegExCheck<-c('hourly_data')
+files<-list.files(pattern=paste("(",RegExCheck,")", ".*?\\.csv", sep = ""))
+
+month_label<-vector()
+year_label<-vector()
+
+#Extract the month and year labels from the file names
+for(i in 1:length(files)){
+  month_label[i]<-getMonth(files[i],nchar(files[i])) 
+  year_label[i]<-getYear(files[i])
+}
+
+myfiles <- lapply(files, fread)
+
+#Assign month and year labels to each dataframe
+for(i in 1:length(myfiles)){
+    myfiles[[i]]$year<-year_label[i]
+    myfiles[[i]]$month<-month_label[i]
+}
+
+#Combine all files into single dataframe then consolidate by daily averages for each pollutant and create a separate data frame for daily averages by station.
+raw_data_set<-rbindlist(myfiles)
+daily_data_set_without_station <-data.table(raw_data_set)[,.(daily_average_value=mean(value, na.rm = T)), by =
+                                                         c('year','month','day','parameter')]
+daily_data_set_with_station <-data.table(raw_data_set)[,.(daily_average_value=mean(value, na.rm = T)), by =
+                                                         c('year','month','day','parameter','station')]
+
+#Combine day, month and year to create date column
+daily_data_set_without_station$date <- as.Date(paste(daily_data_set_without_station$month,
+                                                     daily_data_set_without_station$day,
+                                                     daily_data_set_without_station$year, sep = "."),
+                                                     format="%m.%d.20%y")
+
+daily_data_set_with_station$date <- as.Date(paste(daily_data_set_with_station$month,
+                                                  daily_data_set_with_station$day,
+                                                  daily_data_set_with_station$year, sep = "."),
+                                                  format="%m.%d.20%y")
+
+#Load weather data set, standardize date format, and create new variable measuring the daily range of temperatures
+weather <- data.table(read_xlsx("weather.xlsx"))
+weather[,"date"] <- as.Date(weather$date, format="20%y.%m.%d")
+weather[,"temp_range"] <- weather[,"temp_max"] - weather[,"temp_min"]
+
+#Left join on daily pollutant data for both data sets with weather data
+daily_data_set_without_station<-merge(daily_data_set_without_station, weather, all.x=T, by.x ='date', by.y = 'date')
+daily_data_set_with_station<-merge(daily_data_set_with_station, weather, all.x=T, by.x ='date', by.y = 'date')
+
+#Create mapping for compounds for both datasets
+mapping<-as.integer(c(1,6,7,8,9,10,12,14,20,30,35,37,38,39,42,43,44))
+compound<-c('SO2','CO','NO','NO2','PM2.5','PM10','NOx','O3','TOL','BEN','EBE','MXY','PXY','OXY','TCH','CH4','MHC')
+full_mapping<-data.table(mapping,compound)
+full_daily_data_set_without_station<-merge(daily_data_set_without_station, full_mapping, all.x = T, by.x =
+                                           'parameter', by.y = 'mapping')
+full_daily_data_set_with_station<-merge(daily_data_set_with_station, full_mapping, all.x = T, by.x =
+                                        'parameter', by.y = 'mapping')
+
+#Import the stations list file, which includes stations' names and coordinates
+stations <- data.table(read_xlsx("stationslist.xlsx"))
+
+#Merge data to include station coordinates/names and filter by compounds of interest
+stations_data_set<-compoundFilter(bindWithStations(full_daily_data_set_with_station))
+
+#Filter data sets for only the commpounds of interest
+non_stations_data_set<-compoundFilter(full_daily_data_set_without_station)
+
+```
+
+
+### Quick Analysis:
+The following **Knit** runs several high level analyses on the current combined dataframe (without taking into account stations). Based on the graphical outputs, it can clearly be seen that there is a cyclical pattern to the average pollutant levels.   
+```{r first_plots}
+
+#Summary of variables
+lapply(non_stations_data_set, summary)
+
+#Exclude certain variables for plotting as they offer very little value in this context as we are using time series charts.
+time_series<-non_stations_data_set[, -which(names(non_stations_data_set) %in% c('year', 'month', 'day','parameter'))]
+
+#Plot multiple time series charts for all numerical values present in the data set
+for(i in seq_along(time_series)){
+    if(is.numeric(time_series[,i])){
+        #Carve out for daily average values as these need to be grouped by pollutant
+        if(colnames(time_series)[i] == 'daily_average_value'){
+            plot<-ggplot(time_series, aes(date, time_series[,i])) + geom_line(aes(color = compound)) + 
+                        scale_x_date(date_labels = "%b %Y") + ylab(colnames(time_series)[i]) + ggtitle(paste0("Time Series Chart of ", colnames(time_series)[i]))
+          
+        #Plot all other numeric values    
+        }else {
+          plot<-ggplot(time_series, aes(date, time_series[,i])) + geom_line(colour="#000099") + 
+                scale_x_date(date_labels = "%b %Y") + ylab(colnames(time_series)[i]) + ggtitle(paste0("Time Series Chart of ", colnames(time_series)[i]))
+        }
+      print(plot)
+    }
+}
+
+ggplot(non_stations_data_set,aes(compound,daily_average_value)) + geom_boxplot(aes(color = compound), notch=T,
+      outlier.colour = "black", outlier.shape = 4) + coord_flip() + ggtitle("Boxplot of Compounds")
+
+```
+
+
+### Peak Hour Data Prep
+The following **knit** creates data sets filtering out weekends, holidays as well as non-commuter hours with the purpose of understanding the level of pollutants during peak periods of travel.
+```{r hourly_prep}
+
+#Establish on what types of days were the observations made
+non_stations_data_set$dayofw <- weekdays(as.Date(non_stations_data_set$date))
+non_stations_data_set$weekend <- as.logical(is.weekend(non_stations_data_set$date))
+non_stations_data_set$holiday <- as.logical(is.holiday(non_stations_data_set$date))
+
+stations_data_set$dayofw <- weekdays(as.Date(stations_data_set$date))
+stations_data_set$weekend <- as.logical(is.weekend(stations_data_set$date))
+stations_data_set$holiday <- as.logical(is.holiday(stations_data_set$date))
+
+#Establish a peak value table for all weekdays, which is an average of certain hours
+weekday_data_set <-data.table(raw_data_set)[,.(peakvalue=mean(value[hour %in% c(8:10,18:20)], na.rm =
+                        T)),by=c('year','month','day','parameter')]
+
+#Merge with the original non_stations_data_set to capture the full set of relevant data points
+weekday_data_set<-merge(non_stations_data_set, weekday_data_set, all.x=T, by=c('year','month','day','parameter'))
+
+#Build a data set with pollutants per date, with a different value for peak hours
+weekday_data_set <- weekday_data_set[(weekday_data_set$weekend==F & weekday_data_set$holiday==F),]
+
+```
+
+
+### Peak Hour Analysis
+Based on the given analysis it can be seen that pollutants during peak periods are fairly consistent throughout the work week and are on average higher than the daily averages. Though the hour of the day consistently affects the pollution level observed around the city, other factors like seasonality seem to have a much more important effect on pollution levels. 
+```{r second_plots}
+
+#Print line charts displaying daily peak and daily average values for each pollutant during 2016 
+for(pollutant in unique(weekday_data_set$compound)){
+    peakhour_dataset<-weekday_data_set[(weekday_data_set$compound == pollutant & weekday_data_set$year == 2016 ),]
+    
+    plot0<-ggplot(peakhour_dataset, aes(x = date)) + geom_line(aes(y = peakvalue, colour="Daily Peak")) + geom_line(aes(y = daily_average_value, colour = "Daily Average")) + ylab(label="Value Observed") + xlab("Time") + ggtitle(paste0("2016 Comparison of Daily Peak Values and Average Daily Values for ", pollutant))
+    
+    print(plot0)
+}
+
+#Print Daily Peak and Daily Average Values for each pollutant
+for(pollutant in unique(weekday_data_set$compound)){
+    peakhour_dataset<-weekday_data_set[weekday_data_set$compound == pollutant,]
+    
+    plot1<-ggplot(peakhour_dataset, aes(dayofw, peakvalue)) + geom_boxplot(aes(color = dayofw), notch=T, outlier.colour = "black", outlier.shape = 4) + coord_flip() + ggtitle(paste0("Boxplot of Daily Peak Values During the Week for ", pollutant))
+  
+    plot2<-ggplot(peakhour_dataset, aes(dayofw, daily_average_value)) + geom_boxplot(aes(color = dayofw), notch=T, outlier.colour = "black", outlier.shape = 4) + coord_flip() + ggtitle(paste0("Boxplot of Daily Average Values During the Week for ", pollutant))
+    
+    print(plot1)
+    print(plot2)
+}
+
+```
+
+
+### Geo-visualization of Stations
+Prepares Madrid map overlay for station locations to give a graphical understanding of station locations. Each pollutant's average values during the entire duration of the studied time frame will be displayed. It is clear based on the map that the prevelancy of a given pollutant varies from region to region. While its average levels overall are not especially high per previous analysis, PM2.5 has noticeably high levels in outer regions and el Parque Retiro. NO2 seems to be the most prevelent pollutant towards the center of the city and northern regions, while O3 is primarily concentrated in the north and SO2 appearing sporadically.
+
+Pollution levels varied across different areas of the city. The present analysis notes that O3 pollution levels have increased between 2011 and 2016, chiefly in suburban areas. This evolution could be caused by urban sprawlBy contrast, as pollution levels have remained relatively steady in central areas.  NO2 emission levels have decreased in most areas of the city. 
+```{r geolocation}
+
+#Prep data for geo-visualization analysis by taking each pollutant's average value over the course of the study
+raw_total_data <-data.table(raw_data_set)[,.(total_average_value=mean(value, na.rm = T)), by = c('parameter','station')]
+
+#Merge and filter data set to include only necessary information (i.e. total_average_value, compound, and geography information)
+raw_total_data<-merge(raw_total_data, full_mapping, all.x = T, by.x = 'parameter', by.y = 'mapping')
+geolocation_data<-compoundFilter(bindWithStations(raw_total_data))
+
+head(geolocation_data)
+
+#Outputs map of stations with their average pollutant levels over the entire studied time frame
+colorsmap <- colors()[c(490,24,100,657)]
+
+madrid <- leaflet(data.frame(geolocation_data)) %>%
+  addTiles() %>%  # Add default OpenStreetMap map tiles
+  addCircleMarkers(lng=~lon, lat=~lat,
+                   popup= ~paste(station,compound, sep=' '),
+                   radius = ~total_average_value,
+                   color= ~colorsmap,
+                   group= unique(geolocation_data$compound)) %>% 
+  addLegend("bottomright", colors = colorsmap, labels = unique(geolocation_data$compound))
+
+madrid
+
+#Prep data to view mapping by compound
+raw_total_data_yearly <-data.table(raw_data_set)[,.(total_average_value=mean(value, na.rm = T)), by = c('parameter','station','year')]
+
+raw_total_data_yearly<-merge(raw_total_data_yearly, full_mapping, all.x = T, by.x = 'parameter', by.y = 'mapping')
+geolocation_data_yearly<-compoundFilter(bindWithStations(raw_total_data_yearly))
+
+#Create maps by pollutant type and stores them in a list
+maps<-list()
+map_count = 1
+for(pollutant in unique(geolocation_data_yearly$compound)){
+    maps[[map_count]]<-compoundGeographicalAnalysis(geolocation_data_yearly, pollutant)
+    map_count = map_count + 1
+}
+
+#Solution is inelegant as testing other options were unsuccessful when implementing in knit
+maps[[1]]
+maps[[2]]
+maps[[3]]
+maps[[4]]
+
+
+```
+
+
+#### Heatmap of Variable Correlations
+The following **knit** creates a heatmap of all numerical variables present in the data set. The clearest insights that can be drawn is a fairly strong negative correlation between temperature and humidity as well as a slight positive correlation between precipitation and humidity (perhaps self-evident observations). A weak positive correlation can be seen between wind measures against precipitation and temperature range, which also intuitively makes sense.
+```{r heatmap}
+
+heatmap_data<-non_stations_data_set[, -which(names(non_stations_data_set) %in% c('day','parameter'))]
+d3heatmap::d3heatmap(cor(heatmap_data[, sapply(heatmap_data, is.numeric)]))
+
+```
+
+## NO2 Regression Analysis
+Based on the outputs of the regression analysis, the model does a fair job (r-squared of 0.6763) predicting the average daily NO2 levels. The majority of variables are found to be very significant other than precipitation whether the targetted day is during the middle of the week (interstingly if the targetted day is a Monday, Saturday or Sunday this has a material effect on NO2 levels). Graphically it can be seen that the model has a difficult time predicting major spikes in NO2 levels implying that some other factor not accounted for is driving this.
+
+Further analysis reveals strong potential multicollinearity between the various temperature variables and humidity due to high Variance Inflation Factors (VIF) meaning that the standard error for the coefficient is heavily inflated making it more difficult to assess if that variable by itself is significant to the model. Per general guidlines, a maximum threshold of 5 and 10 were imposed (different literature prescribe different cutoffs), which additionally excludes humidity based on these parameters. This intuitively makes sense based on previous correlation analyses. However, removing these variables materially decreases the r-squared value (current value of 0.6549 or 0.671 for a 5 and 10 VIF cutoff respectively). As a result, there are likely other explanatory variables that drive NO2 levels that the model fails to capture.
+
+A quick analysis of the residuals show a normal distribution and does not reveal strong heteroskedasticity nor a discernable pattern.
+```{r regression_NO2}
+
+#Run initial regression with NO2 as explanatory variable and obvious irrelevant variables removed
+NO2_data<-data.table(non_stations_data_set[non_stations_data_set$compound == 'NO2',])
+lm1<-lm(daily_average_value~., data=NO2_data[,!c('parameter','compound')])
+
+print(summary(lm1))
+
+#Check for multicollinearity
+multi_check<-multiCollinearityCheck(NO2_data)
+print(multi_check)
+
+#Rerun with variables found to have multicollinearity or are insignificant removed
+#VIF cutoff of 5
+variables_to_remove<-removeExtraneousVariables(multi_check, lm1, 5)
+lm2<-lm(daily_average_value~., data=NO2_data[,setdiff(names(NO2_data), variables_to_remove), with = F])
+
+print(summary(lm2))
+runRegressionPlots(NO2_data, lm2)
+
+#VIF cutoff of 10
+variables_to_remove<-removeExtraneousVariables(multi_check, lm1, 10)
+lm3<-lm(daily_average_value~., data=NO2_data[,setdiff(names(NO2_data), variables_to_remove), with = F])
+
+print(summary(lm3))
+runRegressionPlots(NO2_data, lm3)
+```
+
+## O3 Regression Analysis
+Based on the outputs of the regression analysis, the model does a superior job (r-squared of 0.7517) in predicting the average daily O3 levels than it does NO2 levels. For this pollutant, the majority of variables are found to be very significant (including precipitation) other than whether the targetted day is a weekday (conversely, if the day falls on a weekend, this seems to have a material effect). Like NO2, it can be seen that the model still has a difficult time predicting major spikes in O3 levels supporting the theory that some other exogenous variable(s) exist. This is an interesting observation as it was seen previously that the NO2 and O3 cycles are not in sync, suggesting that while the models capture the disparate seasonlity effects, one of the possible missing variables has a similar effect on both compounds.
+
+Multicollinearity analysis reveals similar results as NO2 with the r-squred value falling to 0.686 or 0.7515 (dependent on the VIF cutoff) after removing the appropriate variables. Residual analysis gives similar results to NO2.
+```{r regression_O3}
+
+#Run initial regression with NO2 as explanatory variable and obvious irrelevant variables removed
+O3_data<-data.table(non_stations_data_set[non_stations_data_set$compound == 'O3',])
+lm1<-lm(daily_average_value~., data=O3_data[, !c('parameter','compound')])
+
+print(summary(lm1))
+
+#Check for multicollinearity
+multi_check<-multiCollinearityCheck(O3_data)
+print(multi_check)
+
+#Rerun with variables found to have multicollinearity or are insignificant removed
+#VIF cutoff of 5
+variables_to_remove<-removeExtraneousVariables(multi_check, lm1, 5)
+lm2<-lm(daily_average_value~., data=O3_data[,setdiff(names(O3_data), variables_to_remove), with = F])
+
+print(summary(lm2))
+runRegressionPlots(O3_data, lm2)
+
+#VIF cutoff of 10
+variables_to_remove<-removeExtraneousVariables(multi_check, lm1, 10)
+lm3<-lm(daily_average_value~., data=O3_data[,setdiff(names(O3_data), variables_to_remove), with = F])
+
+print(summary(lm3))
+runRegressionPlots(O3_data, lm3)
+```
+
+
+## SO2 Regression Analysis
+Additional regressions were run on SO2 and PM2.5, which returned inferior r-squared values (0.4875 and 0.3325 respectively). It was found that very few variables were statistically significant and similiar multicollinearity results from the previous models held in these instances. Therefore it is clear that materially different factors drive levels for these pollutants from NO2 and O3. As previously seen, these pollutants are not necessarily present in all stations signifying that location specific factors play a significant role.
+```{r regression_SO2}
+
+#Run initial regression with NO2 as explanatory variable and obvious irrelevant variables removed
+SO2_data<-data.table(non_stations_data_set[non_stations_data_set$compound == 'SO2',])
+lm1<-lm(daily_average_value~., data=SO2_data[, !c('parameter','compound')])
+
+print(summary(lm1))
+
+#Check for multicollinearity
+multi_check<-multiCollinearityCheck(SO2_data)
+print(multi_check)
+
+#Rerun with variables found to have multicollinearity or are insignificant removed
+#VIF cutoff of 5
+variables_to_remove<-removeExtraneousVariables(multi_check, lm1, 5)
+lm2<-lm(daily_average_value~., data=SO2_data[,setdiff(names(SO2_data), variables_to_remove), with = F])
+
+print(summary(lm2))
+runRegressionPlots(SO2_data, lm2)
+
+#VIF cutoff of 10
+variables_to_remove<-removeExtraneousVariables(multi_check, lm1, 10)
+lm3<-lm(daily_average_value~., data=SO2_data[,setdiff(names(SO2_data), variables_to_remove), with = F])
+
+print(summary(lm3))
+runRegressionPlots(SO2_data, lm3)
+```
+
+
+## PM2.5 Regression Analysis
+```{r regression_PM2.5}
+
+#Run initial regression with NO2 as explanatory variable and obvious irrelevant variables removed
+PM2.5_data<-data.table(non_stations_data_set[non_stations_data_set$compound == 'PM2.5',])
+lm1<-lm(daily_average_value~., data=PM2.5_data[, !c('parameter','compound')])
+
+print(summary(lm1))
+
+#Check for multicollinearity
+multi_check<-multiCollinearityCheck(PM2.5_data)
+print(multi_check)
+
+#Rerun with variables found to have multicollinearity or are insignificant removed
+#VIF cutoff of 5
+variables_to_remove<-removeExtraneousVariables(multi_check, lm1, 5)
+lm2<-lm(daily_average_value~., data=PM2.5_data[,setdiff(names(PM2.5_data), variables_to_remove), with = F])
+
+print(summary(lm2))
+runRegressionPlots(PM2.5_data, lm2)
+
+#VIF cutoff of 10
+variables_to_remove<-removeExtraneousVariables(multi_check, lm1, 10)
+lm3<-lm(daily_average_value~., data=PM2.5_data[,setdiff(names(PM2.5_data), variables_to_remove), with = F])
+
+print(summary(lm3))
+runRegressionPlots(PM2.5_data, lm3)
+
+```
+
+## Conclusion
+Based on the outputs from this analysis several conclusions can be drawn. It is very apparent that specific pollutant levels are region specific with their prevelence highly dependent on the location in Madrid, therefore implying the conditions necessary to increase their levels are not consistent from one pollutant to another. This is further supported by analysis showing that the peaks and troughs of each pollutant do not align and that conducting regression analysis using similar explanatory variables can have widely different levels of effectiveness. While seasonality, temperature, and weekends seems to be a common factor among them, other weather factors have differing effects. Consequently, it can be conluded that some other uncaptured factor(s) that differ between each station have significant effects on driving pollution levels (though not necessarily to the same degree for each pollutant type). Further data and analysis is needed to be able to devise models that can more accurately predict the degree of pollution. 
