@@ -1,0 +1,235 @@
+---
+title: "test_3_Andrew_Martinez"
+author: "Andrew Martinez"
+date: "12/20/2018"
+runtime: shiny
+output: html_document
+---
+
+## Install Necessary Packages
+```{r install, include=FALSE}
+if(!"quantmod" %in% installed.packages()) {install.packages("quantmod")}
+library("quantmod")
+
+if(!"readxl" %in% installed.packages()) {install.packages("readxl")}
+library(readxl)
+
+if(!"plotly" %in% installed.packages()) {install.packages("plotly")}
+library("plotly")
+
+if(!"reshape" %in% installed.packages()) {install.packages("reshape")}
+library(reshape)
+
+if(!"cluster" %in% installed.packages()) {install.packages("cluster")}
+library(cluster) 
+
+if(!"fpc" %in% installed.packages()) {install.packages("fpc")}
+library(fpc)
+
+if(!"NbClust" %in% installed.packages()) {install.packages("NbClust")}
+library("NbClust")
+
+if(!"magrittr" %in% installed.packages()) {install.packages("magrittr")}
+library(magrittr)
+
+if(!"data.table" %in% installed.packages()) {install.packages("data.table")}
+library(data.table) 
+
+if(!"shiny" %in% installed.packages()) {install.packages("shiny")}
+library(shiny)
+
+```
+
+
+## Helper Functions
+```{r function, include = FALSE}
+#Change column labels for daily return and volatility to include associated ticker
+includeTicker<-function(env_input, symbol){
+  all_labels<-names(env_input[[symbol]])
+  all_labels[length(all_labels)]<-paste0(symbol,".Daily_Return")
+  
+  #Override existing names with newly created label
+  names(env_input[[symbol]]) <- all_labels
+  output<-env_input[[symbol]]
+  
+  return(output)
+  
+}
+
+#Plots charts related to regression residuals
+residualAnalysis<-function(data_set, regression_output){
+  
+  #Histogram of Residuals
+  hist(regression_output$residuals, main="Residual Histogram")
+  
+  #Boxplot of Residuals
+  boxplot(regression_output$residuals, main="Residual Boxplot")
+  
+  #Line plot of Residuals
+  plot(regression_output$residuals, type='l', main='Model Residuals')
+}
+
+#Load equity pricing data from yahoo from the start of the year 2016 to the present
+getEquityData<-function(symbol, start){
+  #Gives current status of data load
+  cat("Downloading time series for symbol '", symbol, "' ...\n", sep = "")
+  
+  #Get data from yahoo and saves it in the NASDAQ environment
+  getSymbols(symbol, env = nasdaq, src = "yahoo", from = as.Date(start))
+  
+  #Calculate the daily return
+  nasdaq[[symbol]]$Daily_Return<-dailyReturn(nasdaq[[symbol]])
+  
+  #Rename newly created columns to include ticker name and extract only those columns into an output xts object
+  final_output<-includeTicker(nasdaq, symbol)
+  final_output<-final_output[,grep("Daily_Return",colnames(final_output))]
+
+  return(final_output)
+  
+}
+```
+
+
+## Load Data
+Loads all data from a provided list using the previously described helper functions.
+```{r data_load, echo=FALSE, warning = FALSE}
+#Prevent standard yahoo warnings from appearing
+options("getSymbols.yahoo.warning"=FALSE)
+options("getSymbols.warning4.0"=FALSE)
+
+#Load ticker mapping from .xlsx file (Set WD as needed for nasdaq file)
+ticker_mapping <- data.frame(read_xlsx("nasdaq_symbols.xlsx"))
+
+#Set Start Date
+starting_date = '2016-01-01'
+
+#Create NASDAQ environment to make full use of quantmod functionality and to store original data
+nasdaq <- new.env()
+stocks <- lapply(ticker_mapping$Symbol, getEquityData, starting_date)
+  
+```
+
+
+## Prep data for analysis
+```{r cluster_prep, message = FALSE}
+#Merges list of equity data into single xts data structure
+only_returns<-do.call(merge.xts, stocks)
+
+#Gets the standard deviation of the daily returns of each ticker across the full time horizon, converts the xts to a dataframe and reshapes the structure
+sd_values<-melt(data.frame(lapply(only_returns, sd, na.rm=T)))
+sd_values<-sd_values[,c("value")]
+
+#Gets the mean of the daily returns of each ticker across the full time horizon, converts the xts to a dataframe and binds this structure the previously created structure containing standard deviation.
+data_cluster<-cbind(melt(data.frame(lapply(only_returns, colMeans, na.rm=T))), sd_values)
+
+#Renames the column headers and removes the ticker header
+all_titles<-c("Ticker", "Avg_Daily_Return", "Volatility")
+names(data_cluster)<-all_titles
+
+#Sets the ticker as the row names and deletes the ticker column
+row.names(data_cluster)<-ticker_mapping$Symbol
+data_cluster$Ticker = NULL
+head(data_cluster[order(data_cluster$Avg_Daily_Return, decreasing = T),])
+```
+
+## Regression Analysis
+Regression analysis reveals a very weak relationship between the average daily return and volatility across the given the time horizon. Residuals follow a normal distribution, but display levels of heteroskedasticity. This is further demonstrated in graphical analysis of the line of best fit against the data. 
+```{r regression}
+#Create separate regression data structure to allow for custom manipulation
+regression_analysis<-data.table(data_cluster)
+
+#Run regression model and print summary
+lm1 <- lm(Avg_Daily_Return ~ Volatility, data=regression_analysis)
+print(summary(lm1))
+
+#Adds output from regression model to the dataframe
+df_fit<-regression_analysis[, lm_fit:=fitted(lm1)]
+
+#Run Residual Analysis Function
+residualAnalysis(df_fit, lm1)
+
+#Scatter plot fo data with line of best fit
+ggplot(df_fit, aes(x = Volatility, y = Avg_Daily_Return)) + geom_point() + ggtitle("Volatility vs Average Daily Return") + 
+      stat_smooth(method = "lm", formula = y ~ x) 
+
+```
+
+
+## Find Optimal Cluster Count
+```{r cluster count}
+set.seed(62592)
+
+#Using all 30 different indicies, determine the optimal number of clusters using euclidean distance (set range of possible clusters as 2 to 10). Values are scaled for normalization.
+res.nbclust <- data_cluster %>%
+  scale() %>%
+  NbClust(distance = "euclidean",
+          min.nc = 2, max.nc = 10, 
+          method = "kmeans", index ="all") 
+
+```
+
+
+## K-means
+Although the previous analysis largely recommended 3 clusters as the optimal set, 4 were ultimately used as the three clusters that were formed were of limited value (i.e. essentially split into a more aggressive, conservative and balanced clusters with regards to standard deviation with a mix of average returns). Using a 4 cluster scheme, one particular cluster that minimized the standard deviation while still having decent returns (cluster 1) contains this analysis's recommnended stocks for a balanced strategy. Cluster 3 represents a more aggressive strategy, with cluster 4 demonstrating relative underperformance and cluster 2 being a more conservative strategy. A clustering plot using PCA was shown as well, however it is difficult to intuitively understand its output. 
+```{r kmeans, warning = FALSE}
+
+#Runs kmeans algorithm with 4 clusters (only takes numeric variables and scales them)
+k=4
+fit<-kmeans(scale(data_cluster[, sapply(data_cluster, is.numeric)]), centers = k)
+print(fit)
+
+#Creates new scaled dataframe that contains the appended cluster mapping to original input data frame
+equity.scaled <- data_cluster[, sapply(data_cluster, is.numeric)]
+equity.scaled$clusters<-as.factor(fit$cluster)
+
+colorsmap <- c('red','blue','green','orange')
+
+#Regular Cluster Plot Scaled
+plot_ly(equity.scaled, type = "scatter", x = ~Avg_Daily_Return, y = ~Volatility,
+             text =row.names(equity.scaled),color = ~clusters, 
+             colors = colorsmap, mode = 'markers') %>%
+  
+        layout(title = 'Equity Average Daily Return vs Volatility',
+               yaxis = list(zeroline = FALSE),
+               xaxis = list(zeroline = FALSE)) 
+
+```
+
+
+## Show plots of stocks of interest
+```{r cluster_plots, echo = FALSE}
+#Gets tickers for the stocks that were part of cluster 5 (balanced strategy)
+balanced_list<-rownames(equity.scaled[equity.scaled$clusters == 1,])
+
+#Show charts for the balanced list stocks using default quantmod chart settings in a Shiny App
+shinyApp(
+  ui = fluidPage(titlePanel("Stock Closing Price"),
+  #Although analysis only goes as far back as 2016, balanced list plots allow for charting starting at 2000.
+         sidebarLayout(sidebarPanel(
+         dateInput(inputId = "start_date",label = "Start date",
+                     min = '2000-01-01',
+                     max = Sys.Date(),
+                     value = starting_date),
+         dateInput("end_date",
+                   "End Date",
+                   min = starting_date,
+                   max = Sys.Date(),
+                   value = Sys.Date()),
+         selectInput("symbol", label = "Ticker", choices = balanced_list)),
+      
+      mainPanel(plotOutput("stockPlot")))),
+
+  server = function(input, output) {
+    #Recreate nasdaq environemnt to allow use of charSeries function
+     nasdaq2 <- new.env()
+     output$stockPlot <- renderPlot({
+     stock_data<-quantmod::getSymbols(input$symbol, env = nasdaq2, src = "yahoo", from=input$start_date, 
+     to=input$end_date)
+     chartSeries(nasdaq2[[input$symbol]], name = paste0(input$symbol), TA="addVo();addMACD();addBBands()")
+     
+   })
+  },
+
+  options = list(height = 1000)
+)
+```
